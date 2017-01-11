@@ -46,7 +46,6 @@ import math, os, sys, stat, re, json, time
 import base64, hashlib, hmac
 import six
 import uuid
-import urllib
 
 try:
     from urllib.parse import urlparse
@@ -724,8 +723,11 @@ class Synapse:
                              '%s version %i\n' %(filepath,  id_txts, results[0]['id'], results[0]['versionNumber']))
         entity = results[0]
 
+        # bundle = self._getEntityBundle(entity)
+        # cache.add_local_file_to_cache(path = filepath, **bundle['entity'])
+
         bundle = self._getEntityBundle(entity, version=entity['versionNumber'])
-        self.cache.add(bundle['entity']['dataFileHandleId'], filepath)
+        self.cache.add(file_handle_id=bundle['entity']['dataFileHandleId'], path=filepath)
 
         return bundle
 
@@ -806,7 +808,7 @@ class Synapse:
             # # Determine where the file should be downloaded to
             # if downloadFile:
             #     _, localPath, _ = cache.determine_local_file_location(entityBundle)
-            cached_file_path = self.cache.get(entityBundle['entity']['dataFileHandleId'], downloadLocation)
+            cached_file_path = self.cache.get(file_handle_id=entityBundle['entity']['dataFileHandleId'], path=downloadLocation)
 
             # if we found a cached copy, return it
 
@@ -865,14 +867,11 @@ class Synapse:
                     else:
                         raise ValueError('Invalid parameter: "%s" is not a valid value '
                                          'for "ifcollision"' % ifcollision)
-                objectType =  'FileEntity' if submission is None else 'SubmissionAttachment'
-                objectId = entity['id'] if submission is None else submission
-                fileResult = self._getFileHandleDownload(entityBundle['entity']['dataFileHandleId'],
-                                                         objectId, objectType)
-                entity['path'] = self._downloadFileHandle(fileResult['preSignedURL'],
-                                                          downloadPath, fileResult['fileHandle'])
 
-                self.cache.add(entityBundle['entity']['dataFileHandleId'], downloadPath)
+                entity.update(self._downloadFileEntity(entity, downloadPath, submission,
+                                                       file_handle_id=entityBundle['entity']['dataFileHandleId']))
+
+                self.cache.add(file_handle_id=entityBundle['entity']['dataFileHandleId'], path=downloadPath)
 
                 if 'path' in entity and (entity['path'] is None or not os.path.exists(entity['path'])):
                     entity['synapseStore'] = False
@@ -1740,45 +1739,65 @@ class Synapse:
     ##               File handle service calls                ##
     ############################################################
 
-    def _getFileHandleDownload(self, fileHandleId,  objectId, objectType='FileEntity'):
+    def _downloadFileEntity(self, entity, destination, submission=None, file_handle_id=None):
         """
-        Gets the URL and the metadata as filehandle object for a filehandle or fileHandleId
+        Downloads the file associated with a FileEntity to the given file path.
 
-        :param fileHandleId:   ID of fileHandle to download
-        :param objectId:       The ID of the object associated with the file e.g. syn234
-        :param objectType:     Type of object associated with a file e.g. FileEntity, TableEntity
-
-        :returns: dictionary with keys: fileHandle, fileHandleId and preSignedURL
+        :returns: A file info dictionary with keys path, cacheDir, files
         """
-        body = {'includeFileHandles':True, 'includePreSignedURLs': True,
-                'requestedFiles':[{'fileHandleId':fileHandleId,
-                                   'associateObjectId': objectId,
-                                   'associateObjectType':objectType}]}
-        results = self.restPOST('/fileHandle/batch', body=json.dumps(body),
-                                endpoint=self.fileHandleEndpoint)
-        return results['requestedFiles'][0]
+        if submission is not None:
+            url = '%s/evaluation/submission/%s/file/%s' % (self.repoEndpoint, id_of(submission),
+                                                           entity['dataFileHandleId'])
+        elif 'versionNumber' in entity:
+            url = '%s/entity/%s/version/%s/file' % (self.repoEndpoint, id_of(entity), entity['versionNumber'])
+        else:
+            url = '%s/entity/%s/file' % (self.repoEndpoint, id_of(entity))
 
-
-    def _downloadFileHandle(self, url, destination, fileHandle, retries=5):
-        """
-        Download a file from the given URL to the local file system.
-
-        :param url:         source of download
-        :param destination: destination on local file system
-        :param fileHandle:  a fileHandle dictionary for the file to download
-        :param retries:     (default=5) Number of download retries attempted before
-                            throwing an exception.
-
-        :returns: path to downloaded file
-        """
+        # Create the necessary directories
         try:
             os.makedirs(os.path.dirname(destination))
         except OSError as exception:
             if exception.errno != os.errno.EEXIST:
                 raise
+
+        return self._downloadFile(url, destination, file_handle_id, entity.get("md5", None))
+
+
+    def _downloadFile(self, url, destination, file_handle_id=None, expected_md5=None):
+        """
+        Download a file from a URL to a the given file path.
+
+        :returns: A file info dictionary with keys path, cacheDir, files
+        """
+        def returnDict(destination):
+            """internal function to cut down on code cluter by building return type."""
+            return  {'path': destination,
+                     'files': [None] if destination is None else [os.path.basename(destination)],
+                     'cacheDir': None if destination is None else os.path.dirname(destination) }
+
+        return returnDict(self._download_with_retries(url, destination, file_handle_id, expected_md5))
+
+
+    def _download_with_retries(self, url, destination, file_handle_id=None, expected_md5=None, retries=5):
+        """
+        Download a file from the given URL to the local file system.
+
+        :param url: source of download
+        :param destination: destination on local file system
+        :param file_handle_id: (optional) if given, the file will be given a
+                               temporary name that includes the file handle id
+                               which allows resuming partial downloads of the same
+                               file from previous sessions
+        :param expected_md5:   (optional) if given, check that the MD5 of the
+                               downloaded file matched the expected MD5
+        :param retries:        (default=5) Number of download retries attempted before 
+                               throwing an exception.
+
+        :returns: path to downloaded file
+        """
         while retries > 0:
             try:
-                return self._download(url, destination, fileHandle['id'], fileHandle.get('contentMd5'))
+                return self._download(url, destination, file_handle_id, expected_md5)
             except Exception as ex:
                 exc_info = sys.exc_info()
                 ex.progress = 0 if not hasattr(ex, 'progress') else ex.progress
@@ -1790,13 +1809,13 @@ class Synapse:
         raise exc_info[0](exc_info[1])
 
 
-    def _download(self, url, destination, fileHandleId=None, expected_md5=None):
+    def _download(self, url, destination, file_handle_id=None, expected_md5=None):
         """
         Download a file from the given URL to the local file system.
 
         :param url: source of download
         :param destination: destination on local file system
-        :param fileHandleId: (optional) if given, the file will be given a
+        :param file_handle_id: (optional) if given, the file will be given a
                                temporary name that includes the file handle id
                                which allows resuming partial downloads of the same
                                file from previous sessions
@@ -1817,21 +1836,18 @@ class Synapse:
                 destination = utils.file_url_to_path(url, verify_exists=True)
                 if destination is None:
                     raise IOError("Local file (%s) does not exist." % url)
-                actual_md5 = utils.md5_for_file(destination).hexdigest()
+                if expected_md5:
+                    actual_md5 = utils.md5_for_file(destination).hexdigest()
                 break
             elif scheme == 'sftp':
                 destination = self._sftpDownloadFile(url, destination)
-                actual_md5 = utils.md5_for_file(destination).hexdigest()
-                break
-            elif scheme == 'ftp':
-                #username, password = self.__getUserCredentials(parsedURL.scheme+'://'+parsedURL.hostname, username, password)
-                urllib.urlretrieve(url, destination)
-                actual_md5 = utils.md5_for_file(destination).hexdigest()
+                if expected_md5:
+                    actual_md5 = utils.md5_for_file(destination).hexdigest()
                 break
             elif scheme == 'http' or scheme == 'https':
                 ## if a partial download exists with the temporary name,
                 ## find it and restart the download from where it left off
-                temp_destination = utils.temp_download_filename(destination, fileHandleId)
+                temp_destination = utils.temp_download_filename(destination, file_handle_id)
                 range_header = {"Range": "bytes={start}-".format(start=os.path.getsize(temp_destination))} \
                                 if os.path.exists(temp_destination) else {}
                 response = _with_retry(
@@ -1850,6 +1866,7 @@ class Synapse:
                     url = response.headers['location']
                     ## don't break, loop again
                 else:
+
                     ## get filename from content-disposition, if we don't have it already
                     if os.path.isdir(destination):
                         filename = utils.extract_filename(
@@ -1887,10 +1904,15 @@ class Synapse:
                     except Exception as ex:  #We will add a progress parameter then push it back to retry.
                         ex.progress  = transferred-previouslyTransferred
                         raise
+
                     actual_md5 = sig.hexdigest()
+
                     ## rename to final destination
                     shutil.move(temp_destination, destination)
+
                     break
+
+            #TODO LARSSON add support of ftp download
             else:
                 sys.stderr.write('Unable to download URLs of type %s' % scheme)
                 return returnDict(None)
@@ -1900,7 +1922,8 @@ class Synapse:
 
         ## check md5 if given
         if expected_md5 and actual_md5 != expected_md5:
-            raise SynapseMd5MismatchError("Downloaded file {filename}'s md5 {md5} does not match expected MD5 of {expected_md5}".format(filename=destination, md5=actual_md5, expected_md5=expected_md5))
+            raise SynapseMd5MismatchError("Downloaded file {filename}'s md5 {md5} does not match expected MD5 of {expected_md5}".format(
+                filename=destination, md5=actual_md5, expected_md5=expected_md5))
 
         return destination
 
@@ -2118,8 +2141,11 @@ class Synapse:
         Performs download of a file from an sftp server.
 
         :param url: URL where file will be deposited.  Path will be chopped out.
+
         :param localFilepath: location where to store file
+
         :param username: username on server
+
         :param password: password for authentication on  server
 
         :returns: localFilePath
@@ -2595,12 +2621,18 @@ class Synapse:
 
         path = self.cache.get(wiki.markdownFileHandleId)
         if not path:
+            url = "{endpoint}/entity/{ownerId}/wiki2/{wikiId}/markdown".format(endpoint=self.repoEndpoint, ownerId=id_of(owner), wikiId=wiki.id)
+            if version is not None:
+                url += "?wikiVersion={version}".format(version=version)
+
             cache_dir = self.cache.get_cache_dir(wiki.markdownFileHandleId)
             if not os.path.exists(cache_dir):
                 os.makedirs(cache_dir)
-            fileResult = self._getFileHandleDownload(wiki['markdownFileHandleId'], wiki['id'], 'WikiAttachment')
-            path = self._downloadFileHandle(fileResult['preSignedURL'], cache_dir, fileResult['fileHandle'])
+
+            path = self._download_with_retries(url, cache_dir, file_handle_id=wiki.markdownFileHandleId)
+
             self.cache.add(wiki.markdownFileHandleId, path)
+
         try:
             import gzip
             with gzip.open(path) as f:
@@ -2665,8 +2697,20 @@ class Synapse:
                                            "CreateOrUpdate not yet supported for wikis.",
                                            response=err.response)
                 raise
+
         return wiki
 
+
+    def _downloadWikiAttachment(self, owner, wiki, filename, destination=None):
+        """
+        Download a file attached to a wiki page
+        """
+        url = "%s/entity/%s/wiki/%s/attachment?fileName=%s" % (self.repoEndpoint, id_of(owner), id_of(wiki), filename,)
+        if not destination:
+            destination = filename
+        elif os.path.isdir(destination):
+            destination = os.path.join(destination, filename)
+        return self._downloadFile(url, destination)
 
     def getWikiAttachments(self, wiki):
         uri = "/entity/%s/wiki/%s/attachmenthandles" % (wiki.ownerId, wiki.id)
@@ -2932,17 +2976,15 @@ class Synapse:
         file_handle_id = download_from_table_result['resultsFileHandleId']
         cached_file_path = self.cache.get(file_handle_id=file_handle_id)
         if cached_file_path is not None:
-            return (download_from_table_result, cached_file_path)
+            return (download_from_table_result, {'path':cached_file_path})
         else:
+            url = '%s/fileHandle/%s/url' % (self.fileHandleEndpoint, file_handle_id)
             cache_dir = self.cache.get_cache_dir(file_handle_id)
             if not os.path.exists(cache_dir):
                 os.makedirs(cache_dir)
-            fileResult = self._getFileHandleDownload(file_handle_id,
-                                                    objectId=_extract_synapse_id_from_query(query),
-                                                    objectType='TableEntity')
-            path = self._downloadFileHandle(fileResult['preSignedURL'], cache_dir, fileResult['fileHandle'])
-            self.cache.add(file_handle_id, path)
-        return (download_from_table_result, path)
+            file_info = self._downloadFile(url, cache_dir, file_handle_id=file_handle_id)
+            self.cache.add(file_handle_id, file_info['path'])
+        return (download_from_table_result, file_info)
 
 
     ## This is redundant with syn.store(Column(...)) and will be removed
@@ -3039,19 +3081,23 @@ class Synapse:
             downloadLocation = self.cache.get_cache_dir(file_handle_id)
             if not os.path.exists(downloadLocation):
                 os.makedirs(downloadLocation)
-
         cached_file_path = self.cache.get(file_handle_id, downloadLocation)
         ## TODO finish cache refactor by handling collisions and
         ## TODO copy from cache to downloadLocation
         if cached_file_path is not None:
-            return cached_file_path
+            return {'path':cached_file_path}
         else:
-            fileResult = self._getFileHandleDownload(file_handle_id,
-                                                    objectId=table_id,
-                                                    objectType='TableEntity')
-            path = self._downloadFileHandle(fileResult['preSignedURL'], downloadLocation, fileResult['fileHandle'])
-            self.cache.add(file_handle_id, path)
-            return path
+            url = "{endpoint}/entity/{id}/table/column/{columnId}/row/{rowId}/version/{versionNumber}/file".format(
+                    endpoint=self.repoEndpoint,
+                    id=table_id,
+                    columnId=column_id,
+                    rowId=rowId,
+                    versionNumber=versionNumber)
+            file_info = self._downloadFile(url, downloadLocation, file_handle_id=file_handle_id)
+
+            self.cache.add(file_handle_id, file_info['path'])
+
+            return file_info
 
 
     def downloadTableColumns(self, table, columns, **kwargs):
@@ -3155,9 +3201,12 @@ class Synapse:
 
             temp_dir = tempfile.mkdtemp()
             zipfilepath = os.path.join(temp_dir,"table_file_download.zip")
-            fileResult = self._getFileHandleDownload(response['resultZipFileHandleId'], table.tableId , 'TableEntity')
+            url = "%s/fileHandle/%s/url" % (self.fileHandleEndpoint, response['resultZipFileHandleId'])
             try:
-                zipfilepath = self._downloadFileHandle(fileResult['preSignedURL'], zipfilepath, fileResult['fileHandle'])
+                zipfilepath = self._download_with_retries(url,
+                                      destination=zipfilepath,
+                                      file_handle_id=response['resultZipFileHandleId'])
+
                 ## TODO handle case when no zip file is returned
                 ## TODO test case when we give it partial or all bad file handles
                 ## TODO test case with deleted fileHandleID
